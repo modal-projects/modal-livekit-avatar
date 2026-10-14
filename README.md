@@ -16,16 +16,31 @@ avatar runner to write. See BitHuman's
 ## Architecture
 
 ```
-┌─────────────────────┐  session.start   ┌──────────────────────────────┐
-│   Agent Worker      │  POST /launch    │  ExpressionAvatar            │
-│   (LiveKit Cloud)   │ ────────────────▶│  (Modal Server, GPU)         │
-│                     │                  │                              │
-│  mints avatar token │                  │  @enter: run container's     │
-│  opens a sticky     │                  │   server, wait /ready        │
-│  session, terminates│                  │  /launch joins the room      │
-│  it when the job    │                  │  (WebRTC). The session keeps │
-│  ends               │                  │  the GPU up until terminate  │
-└─────────────────────┘                  └──────────────────────────────┘
+┌─────────────────┐
+│  Human client   │
+│  (browser)      │
+└────────┬────────┘
+         │  WebRTC: microphone in, avatar video out
+         ▼
+┌────────────────────────────────────────────────────────────┐
+│  LiveKit room                                              │
+└────────▲───────────────────────────────────────▲───────────┘
+         │ join                                  │ join
+         │ speech audio via data stream          │ publish lip-sync video
+         │                                       │
+┌────────┴──────────────────────┐                │
+│  Agent worker                 │                │
+│  LiveKit Cloud or local       │                │
+│                               │ session.start  │
+│  OpenAI Realtime (text only)  │ POST /launch   │
+└────────┬──────────────────────┘────────────────┤
+         │                                       │
+         │ POST /v1/audio/speech                 ▼
+         ▼                          ┌────────────┬───────────────┐
+┌────────┬──────────────┐           │  ExpressionAvatar          │
+│  Qwen3-TTS            │           │  Modal GPU                 │
+│  Modal, voice clone   │           │  sticky session holds GPU  │
+└───────────────────────┘           └────────────────────────────┘
 ```
 
 - **Agent Worker** (`agent/agent_worker.py`): the main LiveKit voice agent.
