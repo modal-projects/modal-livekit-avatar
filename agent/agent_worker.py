@@ -1,20 +1,9 @@
-"""Voice agent: OpenAI Realtime (text) + Qwen3-TTS → BitHuman Expression avatar.
+"""LiveKit voice agent. OpenAI Realtime emits text; Qwen3-TTS speaks it; BitHuman renders video.
 
-OpenAI Realtime handles audio input, turn detection, and reasoning in text-output
-mode (`modalities=["text"]`). The session voices that text with the Modal-hosted
-Qwen3-TTS server via the stock `openai.TTS` plugin, and routes the audio to the
-BitHuman avatar with `DataStreamAudioOutput`. The avatar's GPU container renders
-the video itself: we start a Modal sticky session, POST its `/launch`, and
-terminate the session when the LiveKit job ends.
+From the repo root:
 
-Hold music plays over the ~28s avatar cold start via `BackgroundAudioPlayer`,
-which publishes its own room track (independent of the session speech we redirect
-to the avatar) and stops right before the greeting.
-
-Deploy both containers from the repository root
-(`modal deploy bithuman/expression_server.py` and
-`modal deploy qwen3_tts/qwen3_tts_server.py`), then run:
-
+    modal deploy bithuman/expression_server.py
+    modal deploy qwen3_tts/qwen3_tts_server.py
     uv run agent/agent_worker.py dev
 """
 
@@ -47,50 +36,35 @@ from livekit.agents.types import ATTRIBUTE_PUBLISH_ON_BEHALF
 from livekit.agents.voice.avatar import DataStreamAudioOutput
 from livekit.plugins import openai
 
-# repo-root .env, independent of the working directory
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
 logger = logging.getLogger("bithuman-expression-example")
 
 server = AgentServer()
 
-# identity the BitHuman container joins the room as
 AVATAR_IDENTITY = "bithuman-avatar-agent"
-
-# settle time after the avatar is ready before greeting, so its DataStream audio
-# channel is live when the first segment arrives (a cold start can otherwise drop it)
 AVATAR_AUDIO_SETTLE_DELAY = 0.75
 
-# deployed Modal `@app.server` that proxies BitHuman's `/launch`
 EXPRESSION_APP_NAME = "modal-bithuman-expression"
 EXPRESSION_SERVER_NAME = "ExpressionAvatar"
 EXPRESSION_SERVER = modal.Server.from_name(EXPRESSION_APP_NAME, EXPRESSION_SERVER_NAME)
-# how long the sticky session stays live after the last request if we never
-# terminate it (a crashed agent). A live session is what keeps the GPU up;
-# the shutdown callback releases it as soon as the LiveKit job ends.
+# Released on job shutdown. Also the cap if that callback never runs.
 AVATAR_SESSION_IDLE_TIMEOUT = 60 * 60
-# /launch returns once the avatar has accepted the room, not for the whole call
 LAUNCH_TIMEOUT = aiohttp.ClientTimeout(total=120)
 DEFAULT_AVATAR_PATH = Path(__file__).parent / "avatar.jpg"
 
-# deployed Modal app + `@app.server` class that serves the Qwen3-TTS HTTP API
 QWEN3_APP_NAME = "qwen3-tts-charles"
 QWEN3_SERVER_NAME = "Qwen3TTS"
-# The vLLM OpenAI server validates the `model` field against the served model.
 QWEN3_MODEL_NAME = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
 
 
 def resolve_tts_base_url() -> str:
-    """Resolve the OpenAI-compatible base URL for the deployed Qwen3-TTS server.
-
-    Prefers Modal's `Server.get_url()` for the deployed `@app.server` class, and
-    falls back to `QWEN3_TTS_BASE_URL` if the lookup fails (e.g. before deploy).
-    """
+    """Deployed Qwen server URL, or `QWEN3_TTS_BASE_URL` if that lookup fails."""
     try:
         server_url = modal.Server.from_name(QWEN3_APP_NAME, QWEN3_SERVER_NAME).get_url()
         if server_url:
             return f"{server_url.rstrip('/')}/v1"
-    except Exception as e:  # noqa: BLE001 - fall back to the env override
+    except Exception as e:
         logger.warning("could not resolve Qwen3-TTS URL via Modal: %s", e)
 
     if override := os.getenv("QWEN3_TTS_BASE_URL"):
@@ -102,17 +76,11 @@ def resolve_tts_base_url() -> str:
     )
 
 
-# resolve once at import so only startup pays the Modal lookup
 TTS_BASE_URL = resolve_tts_base_url()
 
 
 async def launch_avatar(ctx: JobContext, avatar_identity: str) -> None:
-    """Open a sticky session and POST BitHuman `/launch` on that container.
-
-    The session, not a Modal method call, keeps the GPU up for the conversation.
-    It is terminated from a shutdown callback so the entrypoint can return while
-    the LiveKit job is still running.
-    """
+    """Start a sticky session and POST BitHuman `/launch`. The session keeps the GPU up."""
     if not (bithuman_secret := os.getenv("BITHUMAN_API_SECRET")):
         raise RuntimeError(
             "BITHUMAN_API_SECRET is required to authorize POST /launch on the Expression server."
@@ -124,7 +92,6 @@ async def launch_avatar(ctx: JobContext, avatar_identity: str) -> None:
         .with_identity(avatar_identity)
         .with_name("BitHuman Avatar")
         .with_grants(api.VideoGrants(room_join=True, room=ctx.room.name))
-        # let the avatar publish audio/video on behalf of this agent
         .with_attributes({ATTRIBUTE_PUBLISH_ON_BEHALF: ctx.local_participant_identity})
         .to_jwt()
     )
@@ -154,11 +121,9 @@ async def launch_avatar(ctx: JobContext, avatar_identity: str) -> None:
         filename="avatar.jpg",
         content_type="image/jpeg",
     )
+    # Modal-Authorization selects the sticky session. Authorization is the BitHuman secret.
     headers = {
-        # Modal routes this request to the container that owns the session.
-        # Stripped before the container sees the request.
         "Modal-Authorization": f"Bearer {avatar_session.token}",
-        # BitHuman's own check. A different header, so it is forwarded.
         "Authorization": f"Bearer {bithuman_secret}",
     }
     launch_url = f"{server_url.rstrip('/')}/launch"
@@ -173,12 +138,7 @@ async def launch_avatar(ctx: JobContext, avatar_identity: str) -> None:
 async def wait_for_avatar_ready(
     ctx: JobContext, avatar_identity: str, timeout: float = 30.0
 ) -> bool:
-    """Block until the avatar is publishing both its audio and video tracks.
-
-    Waiting for both means the avatar's DataStream audio channel is fully set up, so
-    the first greeting segment is acked rather than dropped. Returns False on timeout
-    (we greet anyway).
-    """
+    """Wait until the avatar is publishing audio and video. Greet anyway on timeout."""
 
     def is_ready(participant: rtc.RemoteParticipant) -> bool:
         kinds = {pub.kind for pub in participant.track_publications.values()}
@@ -215,16 +175,11 @@ async def wait_for_avatar_ready(
 async def entrypoint(ctx: JobContext) -> None:
     await ctx.connect()
 
-    # dispatch the avatar concurrently while the session starts
     launch_task = asyncio.create_task(launch_avatar(ctx, AVATAR_IDENTITY))
 
     session = AgentSession(
-        # Realtime handles audio input + VAD but emits text only; the session
-        # voices it with Qwen3-TTS below.
         llm=openai.realtime.RealtimeModel(
             modalities=["text"],
-            # tuned to reduce false barge-ins: a higher threshold ignores room noise,
-            # a longer silence_duration avoids jumping in on short pauses
             turn_detection=ServerVad(
                 type="server_vad",
                 threshold=0.7,
@@ -233,8 +188,6 @@ async def entrypoint(ctx: JobContext) -> None:
                 create_response=True,
             ),
         ),
-        # response_format="wav" so the WAV header carries the model's sample rate
-        # (otherwise the plugin assumes 24 kHz PCM)
         tts=openai.TTS(
             base_url=TTS_BASE_URL,
             api_key="unused",
@@ -242,12 +195,9 @@ async def entrypoint(ctx: JobContext) -> None:
             voice="charles",
             response_format="wav",
         ),
-        # DataStreamAudioOutput doesn't support pause, so disable false-interruption resume
         turn_handling=TurnHandlingOptions(interruption={"resume_false_interruption": False}),
     )
 
-    # gate audio forwarding on the avatar's video track (published last, so the
-    # strongest single "fully ready" signal)
     session.output.audio = DataStreamAudioOutput(
         ctx.room,
         destination_identity=AVATAR_IDENTITY,
@@ -262,13 +212,9 @@ async def entrypoint(ctx: JobContext) -> None:
             ),
         ),
         room=ctx.room,
-        # audio is forwarded to the avatar, so disable room audio output
         room_options=room_io.RoomOptions(audio_output=False),
     )
 
-    # Hold music over the avatar cold start. BackgroundAudioPlayer publishes its own
-    # room track, independent of the session speech we redirect to the avatar, so the
-    # user hears it even though no avatar track exists yet. Stopped before the greeting.
     bg_audio = BackgroundAudioPlayer()
     await bg_audio.start(room=ctx.room, agent_session=session)
 
@@ -280,9 +226,6 @@ async def entrypoint(ctx: JobContext) -> None:
         finally:
             handle.stop()
 
-    # Greet only once the avatar is ready to play audio, then settle briefly: greeting
-    # the instant the video track appears can race the cold GPU start and drop the first
-    # segment. The hold music covers this whole window.
     async with hold_music():
         await launch_task
         await wait_for_avatar_ready(ctx, AVATAR_IDENTITY)

@@ -206,3 +206,21 @@ modal deploy qwen3_tts/qwen3_tts_server.py
 - **Container startup command.** `expression_server.py` launches the image's
   baked-in server (`/opt/venv/bin/python -m src.dispatcher` in `/app`). If a
   future image tag changes this, update the `subprocess.Popen(...)` call.
+- **Logs that look like failures.** A few messages show up on a healthy call:
+  - `no request_id provided for TTS` — vLLM-Omni does not send the
+    `x-request-id` header the OpenAI plugin reads. It substitutes `"unknown"`
+    and still synthesizes audio.
+  - `flush audio emitter due to slow audio generation` — a debug line. Qwen
+    returns one WAV per segment, so the emitter releases that segment in a
+    single flush instead of streaming frames.
+  - `failed to perform clear buffer rpc` / `RpcError: Failed to send`, followed
+    by `playback_finished called more times than playback segments were
+    captured` — the console room disconnected while LiveKit was sending
+    `lk.clear_buffer` to the avatar. The participant was already gone, so the
+    RPC could not be delivered. LiveKit then marks that playout finished on a
+    timer, and a real playback-finished event can arrive as well. The extra
+    call is ignored. A following session that logs `playback finished event
+    received` from `bithuman-avatar-agent` means the avatar path is working.
+  - `FfiHandle.__del__` / `AssertionError` after `process exiting` — LiveKit
+    drops a native handle after its FFI client is already shut down. It shows
+    up on room disconnect and Ctrl-C and does not affect the call.
