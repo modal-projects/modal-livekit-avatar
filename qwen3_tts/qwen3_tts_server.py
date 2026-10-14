@@ -15,7 +15,7 @@ plugin just sends ``voice="charles"`` like any predefined speaker.
 Registration runs on every cold start because Modal's filesystem is ephemeral;
 this is intended and idempotent (re-uploading the same name overwrites in place).
 
-    Deploy with ``modal deploy qwen3_tts_server.py``.
+    Deploy from the repository root with ``modal deploy qwen3_tts/qwen3_tts_server.py``.
 """
 
 import modal

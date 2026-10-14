@@ -4,16 +4,18 @@ OpenAI Realtime handles audio input, turn detection, and reasoning in text-outpu
 mode (`modalities=["text"]`). The session voices that text with the Modal-hosted
 Qwen3-TTS server via the stock `openai.TTS` plugin, and routes the audio to the
 BitHuman avatar with `DataStreamAudioOutput`. The avatar's GPU container renders
-the video itself, so we just mint a token and dispatch to it on Modal.
+the video itself: we start a Modal sticky session, POST its `/launch`, and
+terminate the session when the LiveKit job ends.
 
 Hold music plays over the ~28s avatar cold start via `BackgroundAudioPlayer`,
 which publishes its own room track (independent of the session speech we redirect
 to the avatar) and stops right before the greeting.
 
-Deploy both containers first (`modal deploy expression_server.py` and
-`modal deploy ../qwen3_tts/qwen3_tts_server.py`), then run:
+Deploy both containers from the repository root
+(`modal deploy bithuman/expression_server.py` and
+`modal deploy qwen3_tts/qwen3_tts_server.py`), then run:
 
-    python agent_worker.py dev
+    uv run agent/agent_worker.py dev
 """
 
 import asyncio
@@ -21,7 +23,9 @@ import logging
 import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 
+import aiohttp
 import modal
 from dotenv import load_dotenv
 from hold_music import hold_beats
@@ -43,7 +47,8 @@ from livekit.agents.types import ATTRIBUTE_PUBLISH_ON_BEHALF
 from livekit.agents.voice.avatar import DataStreamAudioOutput
 from livekit.plugins import openai
 
-load_dotenv()
+# repo-root .env, independent of the working directory
+load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
 logger = logging.getLogger("bithuman-expression-example")
 
@@ -56,8 +61,17 @@ AVATAR_IDENTITY = "bithuman-avatar-agent"
 # channel is live when the first segment arrives (a cold start can otherwise drop it)
 AVATAR_AUDIO_SETTLE_DELAY = 0.75
 
-# resolve the Modal class reference once at import, off the per-session path
-EXPRESSION_AVATAR = modal.Cls.from_name("modal-bithuman-expression", "ExpressionAvatar")
+# deployed Modal `@app.server` that proxies BitHuman's `/launch`
+EXPRESSION_APP_NAME = "modal-bithuman-expression"
+EXPRESSION_SERVER_NAME = "ExpressionAvatar"
+EXPRESSION_SERVER = modal.Server.from_name(EXPRESSION_APP_NAME, EXPRESSION_SERVER_NAME)
+# how long the sticky session stays live after the last request if we never
+# terminate it (a crashed agent). A live session is what keeps the GPU up;
+# the shutdown callback releases it as soon as the LiveKit job ends.
+AVATAR_SESSION_IDLE_TIMEOUT = 60 * 60
+# /launch returns once the avatar has accepted the room, not for the whole call
+LAUNCH_TIMEOUT = aiohttp.ClientTimeout(total=120)
+DEFAULT_AVATAR_PATH = Path(__file__).parent / "avatar.jpg"
 
 # deployed Modal app + `@app.server` class that serves the Qwen3-TTS HTTP API
 QWEN3_APP_NAME = "qwen3-tts-charles"
@@ -84,7 +98,7 @@ def resolve_tts_base_url() -> str:
 
     raise RuntimeError(
         "Could not resolve the Qwen3-TTS server URL. Deploy the server "
-        "(`modal deploy ../qwen3_tts/qwen3_tts_server.py`) or set QWEN3_TTS_BASE_URL."
+        "(`modal deploy qwen3_tts/qwen3_tts_server.py`) or set QWEN3_TTS_BASE_URL."
     )
 
 
@@ -93,7 +107,17 @@ TTS_BASE_URL = resolve_tts_base_url()
 
 
 async def launch_avatar(ctx: JobContext, avatar_identity: str) -> None:
-    """Mint an avatar token and dispatch the Modal-hosted Expression avatar."""
+    """Open a sticky session and POST BitHuman `/launch` on that container.
+
+    The session, not a Modal method call, keeps the GPU up for the conversation.
+    It is terminated from a shutdown callback so the entrypoint can return while
+    the LiveKit job is still running.
+    """
+    if not (bithuman_secret := os.getenv("BITHUMAN_API_SECRET")):
+        raise RuntimeError(
+            "BITHUMAN_API_SECRET is required to authorize POST /launch on the Expression server."
+        )
+
     token = (
         api.AccessToken()
         .with_kind("agent")
@@ -105,12 +129,45 @@ async def launch_avatar(ctx: JobContext, avatar_identity: str) -> None:
         .to_jwt()
     )
 
-    logger.info("dispatching Expression avatar")
-    await EXPRESSION_AVATAR().launch.spawn.aio(
-        livekit_url=os.getenv("LIVEKIT_URL"),
-        livekit_token=token,
-        room_name=ctx.room.name,
+    logger.info("starting Expression avatar session")
+    avatar_session = await EXPRESSION_SERVER.sessions.start.aio(
+        idle_timeout=AVATAR_SESSION_IDLE_TIMEOUT
     )
+
+    async def _end_avatar_session() -> None:
+        logger.info("terminating Expression avatar session")
+        try:
+            await EXPRESSION_SERVER.sessions.terminate.aio(avatar_session.token)
+        except Exception:
+            logger.warning("failed to terminate Expression avatar session", exc_info=True)
+
+    ctx.add_shutdown_callback(_end_avatar_session)
+
+    server_url = await EXPRESSION_SERVER.get_url.aio()
+    form = aiohttp.FormData()
+    form.add_field("livekit_url", os.environ["LIVEKIT_URL"])
+    form.add_field("livekit_token", token)
+    form.add_field("room_name", ctx.room.name)
+    form.add_field(
+        "avatar_image",
+        DEFAULT_AVATAR_PATH.read_bytes(),
+        filename="avatar.jpg",
+        content_type="image/jpeg",
+    )
+    headers = {
+        # Modal routes this request to the container that owns the session.
+        # Stripped before the container sees the request.
+        "Modal-Authorization": f"Bearer {avatar_session.token}",
+        # BitHuman's own check. A different header, so it is forwarded.
+        "Authorization": f"Bearer {bithuman_secret}",
+    }
+    launch_url = f"{server_url.rstrip('/')}/launch"
+    async with aiohttp.ClientSession(timeout=LAUNCH_TIMEOUT) as http:
+        async with http.post(launch_url, data=form, headers=headers) as resp:
+            body = await resp.text()
+            if resp.status >= 400:
+                raise RuntimeError(f"POST /launch failed [{resp.status}]: {body}")
+    logger.info("Expression avatar launch accepted for room %s", ctx.room.name)
 
 
 async def wait_for_avatar_ready(
