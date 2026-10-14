@@ -1,17 +1,11 @@
 # Deploy a conversational avatar with LiveKit and Modal
 
-A voice agent with a photorealistic, talking-head
-avatar, where the **avatar runs on GPU on [Modal](https://modal.com)** while the
-voice agent runs on LiveKit Cloud (or locally during development). Speech is a
-voice clone of a short reference clip, synthesized by the open-weights
-[Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) Base model, also on Modal.
+A voice agent with a photorealistic avatar.
 
-The avatar is [BitHuman](https://bithuman.io)'s published Expression GPU container
-(`sgubithuman/expression-avatar`), which is itself a LiveKit avatar worker
-exposing a `/launch` HTTP API. We host that container on a Modal GPU
-(`expression_server.py`) and dispatch to it from the agent — there is no custom
-avatar runner to write. See BitHuman's
-[self-hosted Expression guide](https://docs.bithuman.ai/guides/deploy-self-hosted/).
+The **avatar runs on [Modal](https://modal.com)** while the
+voice agent runs on LiveKit Cloud (or locally during development). Text-to-speech is
+also deployed on Modal using the open-weights [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) 
+model served with vLLM-Omni. OpenAI Realtime is used for Specch-to-text and LLM generation.
 
 ## Architecture
 
@@ -48,29 +42,29 @@ avatar runner to write. See BitHuman's
   Realtime listens, detects turns, and writes the reply as text
   (`modalities=["text"]`). The worker voices that text with the Modal
   [Qwen3-TTS](#voice-cloning-with-qwen3-tts) server through the stock
-  `openai.TTS` plugin, mints an avatar token, and starts a sticky session on
-  the Expression server (`sessions.start`). It then `POST`s `/launch` with
-  that session's token. Session audio is routed to the avatar via
-  `DataStreamAudioOutput`, and the greeting waits until the avatar is
+  `openai.TTS` plugin. The agent also mints an avatar session token, and starts 
+  a sticky session on the Expression server (`sessions.start`). 
+  It then `POST`s `/launch` with that session's token. Session audio is routed 
+  to the avatar via `DataStreamAudioOutput`, and the greeting waits until the avatar is
   publishing video. When the LiveKit job ends, a shutdown callback
   terminates the Modal session.
 
 - **Expression Server** (`bithuman/expression_server.py`): a Modal Server that
   runs the BitHuman GPU container and proxies its port. On container start
-  (`@modal.enter`) it launches the image's own avatar server and waits for
-  `/ready`. `@modal.sessioned()` keeps the GPU up for every live session, which
+  (`@modal.enter`) it launches the image's own avatar server. 
+  `@modal.sessioned()` enables Modal Sessions which
   is what holds the container for the call — WebRTC traffic is invisible to
-  Modal. `max_concurrency=20` is 20 sessions per H100.
+  Modal. `max_concurrency=20` is the estimated concurrency when running on an H100.
 
 - **Qwen3-TTS** (`qwen3_tts/qwen3_tts_server.py`): a Modal server that runs the
-  open-weights Base checkpoint through vLLM-Omni. At startup it uploads a
+  open-weights TTS model using vLLM-Omni. At startup it uploads a
   reference clip as a named voice, then the agent requests that voice like any
   other speaker. See [Voice cloning with Qwen3-TTS](#voice-cloning-with-qwen3-tts).
 
 ## Prerequisites
 
-- A [Modal](https://modal.com) account with the `modal` CLI installed and
-  authenticated
+- A [Modal](https://modal.com) account. Step 1 installs the `modal` CLI; authenticate
+  it there if you have not already
 - A [LiveKit](https://livekit.io) Cloud project (or a self-hosted server)
 - An OpenAI API key (for the Realtime model). Speech itself is open-weights
   Qwen3-TTS, so there is no separate TTS API key
@@ -78,33 +72,48 @@ avatar runner to write. See BitHuman's
 
 ## Setup
 
-### 1. Create the Modal secrets
-
-The Expression container reads the BitHuman API secret from a Modal secret (it
-uses that to license the model). The agent worker sends the same secret as the
-`Authorization` bearer on `POST /launch`, and reads LiveKit and OpenAI
-credentials from its own environment (step 5):
-
-```bash
-modal secret create bithuman \
-  BITHUMAN_API_SECRET=your-bithuman-secret
-```
-
-### 2. Deploy the Expression server to Modal
+### 1. Install dependencies
 
 From the repository root:
 
 ```bash
-modal deploy bithuman/expression_server.py
+uv sync
+```
+
+This installs the agent dependencies, including `modal` and `dotenv`. Later
+steps call that CLI with `uv run modal`. If it is not authenticated yet:
+
+```bash
+uv run modal setup
+```
+
+### 2. Create the Modal secrets
+
+The Expression container reads the BitHuman API secret from a Modal secret (it
+uses that to license the model). The agent worker sends the same secret as the
+`Authorization` bearer on `POST /launch`, and reads LiveKit and OpenAI
+credentials from its own environment (step 6):
+
+```bash
+uv run modal secret create bithuman \
+  BITHUMAN_API_SECRET=your-bithuman-secret
+```
+
+### 3. Deploy the Expression server to Modal
+
+From the repository root:
+
+```bash
+uv run modal deploy bithuman/expression_server.py
 ```
 
 The container downloads ~5 GB of weights into the `bithuman-expression-models`
 volume on first start, cached for later containers.
 
-### 3. Deploy the Qwen3-TTS server
+### 4. Deploy the Qwen3-TTS server
 
 ```bash
-modal deploy qwen3_tts/qwen3_tts_server.py
+uv run modal deploy qwen3_tts/qwen3_tts_server.py
 ```
 
 The agent resolves the URL with
@@ -114,13 +123,13 @@ shipped voice is a clone of Charles; see
 different reference clip. Weights land in the `huggingface-cache` and
 `vllm-cache` volumes on first start.
 
-### 4. Set the avatar portrait (optional)
+### 5. Set the avatar portrait (optional)
 
 The avatar face is `agent/avatar.jpg`. The agent uploads it on each
 `POST /launch`. To use a different face, replace that file and restart the
 agent worker. The Expression server does not need a redeploy for a new face.
 
-### 5. Configure the local environment
+### 6. Configure the local environment
 
 The agent worker is a normal LiveKit agent. Put a `.env` at the repository
 root (the worker loads that file, not one next to the script). It needs the
@@ -128,16 +137,13 @@ standard `LIVEKIT_*` variables, `OPENAI_API_KEY` for the Realtime model, and
 `BITHUMAN_API_SECRET` for the `/launch` bearer (the same value as the Modal
 `bithuman` secret).
 
-### 6. Run the agent worker
+### 7. Run the agent worker
 
-Install the dependencies, then run the worker like any other LiveKit agent — it
-does not run on Modal:
+Run the worker like any other LiveKit agent — it does not run on Modal:
 
 From the repository root:
 
 ```bash
-uv sync
-
 # local development
 uv run agent/agent_worker.py dev
 
@@ -145,7 +151,7 @@ uv run agent/agent_worker.py dev
 uv run agent/agent_worker.py start
 ```
 
-### 7. Test with the Agent Playground
+### 8. Test with the Agent Playground
 
 - Open the "Agents" tab in the LiveKit dashboard for your project.
 - Click "Launch Console" to open the Playground. If you don't see it, wait a
@@ -196,46 +202,5 @@ Point `voice=` in `agent/agent_worker.py` at the same name, then redeploy
 the TTS server:
 
 ```bash
-modal deploy qwen3_tts/qwen3_tts_server.py
+uv run modal deploy qwen3_tts/qwen3_tts_server.py
 ```
-
-## Notes
-
-- **Lifecycle / cost.** `expression_server.py` defaults to `min_containers=1`,
-  which keeps one GPU warm for instant joins (and continuous billing). Set it to
-  `0` to bill per session instead. A live sticky session keeps that GPU up until
-  the agent terminates it (or until `AVATAR_SESSION_IDLE_TIMEOUT`, one hour, if
-  the agent never does). The first session after scaledown pays the cold start
-  (weight download/decrypt + TRT warm).
-- **Ending a call.** The agent registers a LiveKit shutdown callback that calls
-  `sessions.terminate`. That releases the session as soon as the job ends.
-  `AVATAR_SESSION_IDLE_TIMEOUT` in `agent/agent_worker.py` is the backstop when the
-  callback never runs.
-- **GPU sizing.** One `H100` with `max_concurrency=20` handles 20 sticky
-  sessions. A further `sessions.start` scales out another container. Adjust
-  `gpu=` and `max_concurrency=` for your load and budget.
-- **Decrypted weights.** The image expects a tmpfs to keep decrypted weights out
-  of the writable layer. Modal has no tmpfs flag, so the container prints a
-  `SECURITY:` warning; on Modal the container filesystem is ephemeral and
-  isolated, so this is acceptable for the example.
-- **Container startup command.** `expression_server.py` launches the image's
-  baked-in server (`/opt/venv/bin/python -m src.dispatcher` in `/app`). If a
-  future image tag changes this, update the `subprocess.Popen(...)` call.
-- **Logs that look like failures.** A few messages show up on a healthy call:
-  - `no request_id provided for TTS` — vLLM-Omni does not send the
-    `x-request-id` header the OpenAI plugin reads. It substitutes `"unknown"`
-    and still synthesizes audio.
-  - `flush audio emitter due to slow audio generation` — a debug line. Qwen
-    returns one WAV per segment, so the emitter releases that segment in a
-    single flush instead of streaming frames.
-  - `failed to perform clear buffer rpc` / `RpcError: Failed to send`, followed
-    by `playback_finished called more times than playback segments were
-    captured` — the console room disconnected while LiveKit was sending
-    `lk.clear_buffer` to the avatar. The participant was already gone, so the
-    RPC could not be delivered. LiveKit then marks that playout finished on a
-    timer, and a real playback-finished event can arrive as well. The extra
-    call is ignored. A following session that logs `playback finished event
-    received` from `bithuman-avatar-agent` means the avatar path is working.
-  - `FfiHandle.__del__` / `AssertionError` after `process exiting` — LiveKit
-    drops a native handle after its FFI client is already shut down. It shows
-    up on room disconnect and Ctrl-C and does not affect the call.
